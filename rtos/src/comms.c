@@ -21,7 +21,8 @@
 
 static const char *TAG = "pacbot";
 
-// we connect out to the server on the laptop, same as the club's arduino client
+// Websocket connection representing connection to server.
+// We connect out to the server on the laptop, same as the club's arduino client.
 static esp_websocket_client_handle_t client;
 
 // real queue for replies so none get lost
@@ -98,9 +99,18 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
 
     switch (id) {
     case WEBSOCKET_EVENT_CONNECTED:
+
+        // Connection successful!
         ESP_LOGI(TAG, "connected to server!");
+
+        // Disable message bundling.
         ws_no_bundling();
-        comms_send("Hello from ESP32!");
+
+        // Register this ESP32 as a bot with client ID 1.
+        const char* registration =
+            R"({"type":"registration","client_id":"1","role":"bot"})";
+
+        comms_send(registration);
         break;
 
     case WEBSOCKET_EVENT_DISCONNECTED:
