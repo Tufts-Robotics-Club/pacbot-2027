@@ -16,3 +16,6 @@ include/secrets.h
 # python
 .venv/
 __pycache__/
+
+# step test csvs from tune.py
+server/tune_logs/
