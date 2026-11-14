@@ -6,6 +6,8 @@
 #include "freertos/queue.h"
 #include "freertos/event_groups.h"
 
+#include <stdbool.h>
+
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_system.h"
@@ -29,6 +31,12 @@ static esp_websocket_client_handle_t client;
 
 // real queue for replies so none get lost
 static QueueHandle_t reply_queue;
+
+// The server drops us unless the registration is the first message on a new connection.
+// Nothing else gets sent until reply_task has sent it, so imu readings (which skip the
+// queue) or stale queued messages cant get there first. Cleared on every (dis)connect.
+static const char REGISTRATION_MSG[] = R"({"type":"registration","client_id":"1","role":"bot"})";
+static volatile bool registered = false;
 
 static EventGroupHandle_t wifi_events;
 #define WIFI_GOT_IP BIT0
@@ -120,17 +128,14 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
 
         // Connection successful!
         ESP_LOGI(TAG, "connected to server!");
+        registered = false;
 
         // Disable message bundling.
         ws_no_bundling();
 
         // Register this ESP32 as a bot with client ID 1.
         // This has to be the first message or the server drops the connection.
-        {
-            const char *registration =
-                R"({"type":"registration","client_id":"1","role":"bot"})";
-            comms_send(registration);
-        }
+        comms_send(REGISTRATION_MSG);
 
         // Hello after registration so the server logs it as a normal bot message.
         {
@@ -145,6 +150,7 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
 
     case WEBSOCKET_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "disconnected from server, trying again in %d ms", WS_RECONNECT_MS);
+        registered = false;
         motor_command("x");   // turn the motors off so the robot doesnt keep driving with no one in control
         break;
 
@@ -183,14 +189,25 @@ static void ws_start(void)
     ESP_ERROR_CHECK(esp_websocket_client_start(client));
 }
 
-// waits for something to send then sends it if were connected
+// waits for something to send then sends it if were connected.
+// until the registration has gone out, everything else is dropped (same as being disconnected)
 static void reply_task(void *arg)
 {
     char msg[MSG_LEN];
     while (1) {
         xQueueReceive(reply_queue, msg, portMAX_DELAY);
-        if (esp_websocket_client_is_connected(client)) {
-            esp_websocket_client_send_text(client, msg, strlen(msg), pdMS_TO_TICKS(100));
+        if (!esp_websocket_client_is_connected(client)) {
+            continue;
+        }
+        bool is_registration = strcmp(msg, REGISTRATION_MSG) == 0;
+        if (!registered && !is_registration) {
+            continue;
+        }
+        int sent = esp_websocket_client_send_text(client, msg, strlen(msg), pdMS_TO_TICKS(100));
+        // only flip once its actually on the wire. if it failed the server times us out
+        // after 5 s and we reconnect and try again
+        if (is_registration && sent >= 0) {
+            registered = true;
         }
     }
 }
@@ -206,7 +223,7 @@ static void imu_send_task(void *arg)
     while (1) {
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(1000 / IMU_SEND_HZ));
 
-        if (!esp_websocket_client_is_connected(client) || !imu_latest(&d)) {
+        if (!esp_websocket_client_is_connected(client) || !registered || !imu_latest(&d)) {
             continue;
         }
 
