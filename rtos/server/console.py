@@ -1,39 +1,49 @@
-# one terminal for everything: shows the robots imu data, anything else it sends us,
-# and whatever you type gets sent to the robot
+# one terminal for everything: live imu/encoder panel, a scrolling log of everything the
+# robot and cv send us, and a command box at the bottom that sends to the robot
 # usage: .venv/bin/python console.py   (stop server.py first since they use the same port)
+# keys: F1 stop (brake), F2 motors off (coast), ctrl+l clear log, ctrl+q quit
 
 import asyncio
 import json
-import sys
-import threading
-import config
 
-from logger import print_server_message, print_bot_message, print_cv_message
+import config
+import logger
+from logger import print_server_message, print_bot_message, print_cv_message, print_sent_message
 from messages import RegistrationRequestMessage, RegistrationResponseMessage
 
+from rich.text import Text
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.widgets import Footer, Header, Input, RichLog, Static
 from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
+
+BOT_ID = config.CLIENT_IDS["bot"]
+CV_ID = config.CLIENT_IDS["cv"]
 
 # Connected clients as a dictionary of websockets
 connected_clients = {}
 
-latest_imu = None  # newest imu reading
-imu_count = 0  # how many imu messages came in this second
+# high rate telemetry goes to the panel instead of the log so the log stays readable
+latest_imu = None  # newest imu reading as a dict
+imu_count = 0  # imu messages since the last rate update
+imu_rate = 0  # imu messages per second
+latest_enc = None  # newest "enc L: .. R: .." line
 
 
 async def handle_connection(websocket):
 
     print_server_message("Handling incoming websocket connection")
 
-    # Wait for 5 seconds to receive registration message
-    raw_message = await asyncio.wait_for(
-        websocket.recv(),
-        timeout=5,
-    )
-
     client_id = None
 
     try:
+        # Wait for 5 seconds to receive registration message
+        raw_message = await asyncio.wait_for(
+            websocket.recv(),
+            timeout=5,
+        )
+
         # Parse registration message
         registration = RegistrationRequestMessage.from_json(raw_message)
 
@@ -47,6 +57,9 @@ async def handle_connection(websocket):
             reason = f"Client ID {client_id} already conected"
 
             print_server_message(reason)
+
+            # clear it so the finally block doesn't remove the existing connection
+            client_id = None
 
             await websocket.close(
                 code=1008,
@@ -106,8 +119,7 @@ async def handle_connection(websocket):
         )
 
     except ConnectionClosed:
-        print_server_message("Conncetion closed")
-        pass
+        print_server_message("Connection closed")
 
     finally:
         # Only remove the connection owned by this handler
@@ -116,99 +128,166 @@ async def handle_connection(websocket):
             print_server_message(f"Client {client_id} disconnected")
 
 
+# returns True if raw was imu/encoder telemetry and got stored for the panel
+def handle_bot_telemetry(raw):
+    global latest_imu, imu_count, latest_enc
+
+    if raw.startswith("{"):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return False
+        if isinstance(data, dict) and "a" in data and "g" in data:
+            latest_imu = data
+            imu_count += 1
+            return True
+        return False
+
+    if raw.startswith("enc "):
+        latest_enc = raw
+        return True
+
+    return False
+
+
 async def process_message(client_id, raw):
     # TODO: Parse and route messages.
 
     role = config.ROLE_BY_CLIENT_ID.get(client_id)
 
-    match role:
-        case _ if config.VALID_ROLES[0]:
+    if role == "bot":
+        if not handle_bot_telemetry(raw):
             print_bot_message(raw)
 
-        case _ if config.VALID_ROLES[1]:
-            print_cv_message(raw)
+    elif role == "cv":
+        print_cv_message(raw)
 
-        case _:
-            print_server_message(f"Message from unknown client {client_id}: {raw}")
+    else:
+        print_server_message(f"Message from unknown client {client_id}: {raw}")
 
 
-async def main():
-    async with serve(handle_connection, "0.0.0.0", 8765) as server:
-        print_server_message("Server listening on port 8765")
-        await server.serve_forever()
+async def send_to_bot(command):
+    bot = connected_clients.get(BOT_ID)
+    if bot is None:
+        print_server_message("No robot connected, command not sent")
+        return
+    try:
+        await bot.send(command)
+        print_sent_message(command)
+    except ConnectionClosed:
+        print_server_message("Robot disconnected, command not sent")
+
+
+SOURCE_STYLES = {
+    "SERVER": "yellow",
+    "BOT": "green",
+    "CV": "magenta",
+    "SENT": "cyan",
+}
+
+
+class ConsoleApp(App):
+    TITLE = "pacbot console"
+
+    CSS = """
+    #status { height: 1; padding: 0 1; background: $panel; }
+    #telemetry { height: 4; padding: 0 1; border: round $accent; }
+    #log { height: 1fr; border: round $primary; }
+    """
+
+    BINDINGS = [
+        Binding("f1", "stop", "Stop (brake)", priority=True),
+        Binding("f2", "off", "Motors off", priority=True),
+        Binding("ctrl+l", "clear_log", "Clear log", priority=True),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static(id="status")
+        yield Static(id="telemetry")
+        yield RichLog(id="log", wrap=True, max_lines=5000)
+        yield Input(placeholder="command → robot   d <duty> [right] | s | x")
+        yield Footer()
+
+    def on_mount(self):
+        self.log_view = self.query_one("#log", RichLog)
+        self.status = self.query_one("#status", Static)
+        self.telemetry = self.query_one("#telemetry", Static)
+        self.query_one(Input).focus()
+
+        logger.set_sink(self.write_log)
+
+        self.set_interval(1.0, self.update_rate)
+        self.set_interval(0.2, self.refresh_panels)
+        self.refresh_panels()
+
+        # websocket server runs on the same event loop as the ui
+        self.run_worker(self.run_server(), exclusive=True)
+
+    def on_unmount(self):
+        logger.set_sink(None)
+
+    async def run_server(self):
+        async with serve(handle_connection, "0.0.0.0", config.PORT) as server:
+            print_server_message(f"Server listening on port {config.PORT}")
+            await server.serve_forever()
+
+    def write_log(self, time, source, message):
+        line = Text.assemble(
+            (time, "dim"),
+            " ",
+            (f"[{source}]", f"bold {SOURCE_STYLES.get(source, 'white')}"),
+            " ",
+            message,
+        )
+        self.log_view.write(line)
+
+    def update_rate(self):
+        global imu_count, imu_rate
+        imu_rate = imu_count
+        imu_count = 0
+
+    def refresh_panels(self):
+        def dot(client_id, name):
+            if client_id in connected_clients:
+                return (f"● {name}", "bold green")
+            return (f"○ {name}", "dim")
+
+        self.status.update(
+            Text.assemble(
+                dot(BOT_ID, "bot"), "   ", dot(CV_ID, "cv"), ("   port ", "dim"), (str(config.PORT), "dim")
+            )
+        )
+
+        if latest_imu is None:
+            imu = Text("IMU  waiting for data", style="dim")
+        else:
+            a, g = latest_imu["a"], latest_imu["g"]
+            imu = Text(
+                f"IMU  {imu_rate:3d}/s   "
+                f"accel {a[0]:7.1f} {a[1]:7.1f} {a[2]:7.1f} mg   "
+                f"gyro {g[0]:7.2f} {g[1]:7.2f} {g[2]:7.2f} deg/s"
+            )
+
+        enc = Text(latest_enc.replace("enc", "ENC ", 1)) if latest_enc else Text("ENC  waiting for data", style="dim")
+
+        self.telemetry.update(Text("\n").join([imu, enc]))
+
+    async def on_input_submitted(self, event: Input.Submitted):
+        command = event.value.strip()
+        event.input.value = ""
+        if command:
+            await send_to_bot(command)
+
+    async def action_stop(self):
+        await send_to_bot("s")
+
+    async def action_off(self):
+        await send_to_bot("x")
+
+    def action_clear_log(self):
+        self.log_view.clear()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
-
-
-# async def handle_robot(ws):
-#     global robot, latest_imu, imu_count
-#     robot = ws
-#     print(f"robot connected from {ws.remote_address[0]}")
-#     try:
-#         async for msg in ws:
-#             if msg.startswith("{"):
-#                 latest_imu = msg
-#                 imu_count += 1
-#             else:
-#                 print(f"robot: {msg}")
-#     except Exception as e:
-#         print(f"connection error: {e}")
-#     finally:
-#         if robot is ws:
-#             robot = None
-#         print("robot disconnected, waiting for it to come back...")
-
-
-# # once a second instead of 50 times a second so you can still read it and type
-# async def show_imu():
-#     global imu_count
-#     while True:
-#         await asyncio.sleep(1)
-#         if robot is None or latest_imu is None:
-#             continue
-#         d = json.loads(latest_imu)
-#         a, g = d["a"], d["g"]
-#         print(
-#             f"imu {imu_count}/s   accel {a[0]:7.1f} {a[1]:7.1f} {a[2]:7.1f} mg   "
-#             f"gyro {g[0]:6.2f} {g[1]:6.2f} {g[2]:6.2f} deg/s"
-#         )
-#         imu_count = 0
-
-
-# async def send_typed_lines():
-#     # reading the keyboard blocks so it gets its own thread that hands lines to us
-#     loop = asyncio.get_running_loop()
-#     lines = asyncio.Queue()
-
-#     def read_keyboard():
-#         for line in sys.stdin:
-#             loop.call_soon_threadsafe(lines.put_nowait, line.strip())
-
-#     threading.Thread(target=read_keyboard, daemon=True).start()
-
-#     while True:
-#         line = await lines.get()
-#         if not line:
-#             continue
-#         if robot is None:
-#             print("no robot connected yet")
-#             continue
-#         await robot.send(line)
-#         print(f"sent: {line}")
-
-
-# async def main():
-#     async with serve(handle_robot, "0.0.0.0", PORT):
-#         print(
-#             f"waiting for the robot on port {PORT}. type a message and hit enter to send it"
-#         )
-#         await asyncio.gather(show_imu(), send_typed_lines())
-
-
-# if __name__ == "__main__":
-#     try:
-#         asyncio.run(main())
-#     except KeyboardInterrupt:
-#         pass
+    ConsoleApp().run()
