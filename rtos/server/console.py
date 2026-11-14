@@ -8,7 +8,12 @@ import json
 
 import config
 import logger
-from logger import print_server_message, print_bot_message, print_cv_message, print_sent_message
+from logger import (
+    print_server_message,
+    print_bot_message,
+    print_cv_message,
+    print_sent_message,
+)
 from messages import RegistrationRequestMessage, RegistrationResponseMessage
 
 from rich.text import Text
@@ -255,7 +260,11 @@ class ConsoleApp(App):
 
         self.status.update(
             Text.assemble(
-                dot(BOT_ID, "bot"), "   ", dot(CV_ID, "cv"), ("   port ", "dim"), (str(config.PORT), "dim")
+                dot(BOT_ID, "bot"),
+                "   ",
+                dot(CV_ID, "cv"),
+                ("   port ", "dim"),
+                (str(config.PORT), "dim"),
             )
         )
 
@@ -269,7 +278,11 @@ class ConsoleApp(App):
                 f"gyro {g[0]:7.2f} {g[1]:7.2f} {g[2]:7.2f} deg/s"
             )
 
-        enc = Text(latest_enc.replace("enc", "ENC ", 1)) if latest_enc else Text("ENC  waiting for data", style="dim")
+        enc = (
+            Text(latest_enc.replace("enc", "ENC ", 1))
+            if latest_enc
+            else Text("ENC  waiting for data", style="dim")
+        )
 
         self.telemetry.update(Text("\n").join([imu, enc]))
 
