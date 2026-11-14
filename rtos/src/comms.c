@@ -8,6 +8,8 @@
 
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -92,6 +94,22 @@ static void ws_no_bundling(void)
     ESP_LOGW(TAG, "couldnt find the server socket to turn off bundling");
 }
 
+// why the chip last restarted, so we can tell a brownout from a crash without a usb cable
+static const char *reset_reason_text(void)
+{
+    switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "power on";
+    case ESP_RST_SW:        return "software restart";
+    case ESP_RST_PANIC:     return "crash (panic)";
+    case ESP_RST_INT_WDT:   return "interrupt watchdog";
+    case ESP_RST_TASK_WDT:  return "task watchdog";
+    case ESP_RST_WDT:       return "other watchdog";
+    case ESP_RST_BROWNOUT:  return "brownout (power dipped)";
+    case ESP_RST_DEEPSLEEP: return "deep sleep wake";
+    default:                return "unknown";
+    }
+}
+
 static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     esp_websocket_event_data_t *e = data;
@@ -100,7 +118,14 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
     case WEBSOCKET_EVENT_CONNECTED:
         ESP_LOGI(TAG, "connected to server!");
         ws_no_bundling();
-        comms_send("Hello from ESP32!");
+        {
+            // a small "up" time = the chip just restarted (look at the reason).
+            // a big one = it stayed on and only the wifi connection dropped
+            char hello[MSG_LEN];
+            snprintf(hello, sizeof(hello), "Hello from ESP32! (last reset: %s, up %lld s)",
+                     reset_reason_text(), esp_timer_get_time() / 1000000);
+            comms_send(hello);
+        }
         break;
 
     case WEBSOCKET_EVENT_DISCONNECTED:

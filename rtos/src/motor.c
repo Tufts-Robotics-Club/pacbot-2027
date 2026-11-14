@@ -178,16 +178,111 @@ static float mm_s_to_cps(float mm_s)
     return mm_s / MM_PER_COUNT;
 }
 
-// speed mode (ex: v 300, as opposed do duty mode d 30 30): motor_task sets the duty every tick to hold target_cps (right now feedforward only, PI comes next)
+// ---------- measured speed ----------
+// each wheel's speed = how many counts it moved over the last SPEED_WINDOW ticks (~20 ms), updated every tick.
+// count_hist keeps the count from each of the last 20 ticks (a ring buffer) and time_hist the clock time of
+// each one. dividing by the REAL time between them (not "20 ticks = 20 ms") means a late tick cant fake a speed
+#define SPEED_WINDOW 20
+
+static int32_t count_hist[2][SPEED_WINDOW];
+static int64_t time_hist[SPEED_WINDOW];   // esp_timer time of each slot, microseconds since boot
+static int hist_idx;                      // which slot holds the oldest reading (the one ~20 ticks ago)
+static float measured_cps[2];             // latest measured speed of each wheel, counts/s
+
+// called once per motor_task tick
+static void speed_measure(void)
+{
+    int64_t now_us = esp_timer_get_time();
+    int64_t then_us = time_hist[hist_idx];               // when the oldest reading was taken
+    float seconds = (now_us - then_us) / 1000000.0f;    // real time between them, ~0.020 s
+
+    for (int side = 0; side < 2; side++) {
+        int32_t now = encoder_count(side);
+        int32_t then = count_hist[side][hist_idx];      // count ~20 ticks ago
+        count_hist[side][hist_idx] = now;               // this slot now holds the newest count
+        if (then_us > 0 && seconds > 0) {               // then_us is 0 for the first 20 ticks after boot
+            measured_cps[side] = (now - then) / seconds;
+        }
+    }
+    time_hist[hist_idx] = now_us;
+    hist_idx = (hist_idx + 1) % SPEED_WINDOW;           // move to the next oldest slot, wrap around at 20
+}
+
+// ---------- PI gains ----------
+// duty = feedforward + kp * error + ki * (error added up over time), error in mm/s
+// starting guesses from the step tests: 1% duty ~ 7 mm/s, so kp 0.05 turns a 20 mm/s error into 1% more duty
+// change them over wifi with "kp 0.08" / "ki 0.5", see them with "show". copy good values back in here
+static float kp = 0.05f;   // % duty per mm/s of error
+static float ki = 0.5f;    // % duty per (mm/s of error x seconds)
+
+// the speed control runs every CONTROL_PERIOD_MS ticks, not every tick. on the original ESP32, changing a
+// channel's duty waits (busy loops) until the last change has finished, and a change takes up to 2 PWM cycles
+// to finish (it starts at the next cycle and finishes at the end of it): up to 6.7 ms at 300 Hz.
+// changing the duty every 1 ms made motor_task wait ~3 ms per tick and the PI went wild. every 5 ms still hit
+// the wait sometimes (3.7 ms ticks: both motors waiting ~1.7 ms each). 10 ms is longer than 2 cycles, so the
+// last change is always done and it never waits. 100 updates a second is still 6x faster than the motor reacts
+#define CONTROL_PERIOD_MS 10
+
+static uint32_t motor_ticks;   // counts motor_task ticks since boot
+
+static bool control_due(void)
+{
+    return motor_ticks % CONTROL_PERIOD_MS == 0;
+}
+
+// speed mode (ex: v 300, as opposed do duty mode d 30 30): motor_task calls speed_update every tick to hold target_cps
 static struct {
-    bool active; 
+    bool active;
     float target_cps[2]; // speed each wheel should hold (count/sec)
+    float integral[2];   // the I part, already in % duty: grows while the wheel is too slow, shrinks while too fast
+    float duty[2];       // last duty sent to each motor (for the logs)
+    int64_t last_us;     // when speed_update last ran, for the I part's time step. 0 = first run
 } speed_ctl; // speed control
+
+static void speed_reset_integral(void)
+{
+    speed_ctl.integral[ENC_LEFT] = 0;
+    speed_ctl.integral[ENC_RIGHT] = 0;
+    speed_ctl.last_us = 0;
+}
 
 static void speed_update(void)
 {
-    set_motor(ENC_LEFT, ff_duty(ENC_LEFT, speed_ctl.target_cps[ENC_LEFT]));
-    set_motor(ENC_RIGHT, ff_duty(ENC_RIGHT, speed_ctl.target_cps[ENC_RIGHT]));
+    // real time since the last update (normally CONTROL_PERIOD_MS). capped so a long pause cant dump a huge
+    // amount into the I part at once
+    int64_t now_us = esp_timer_get_time();
+    float dt = speed_ctl.last_us ? (now_us - speed_ctl.last_us) / 1000000.0f : CONTROL_PERIOD_MS / 1000.0f;
+    if (dt > 0.05f) dt = 0.05f;
+    speed_ctl.last_us = now_us;
+
+    for (int side = 0; side < 2; side++) {
+        float target = speed_ctl.target_cps[side];
+
+        // target 0 = brake and forget any built up correction
+        if (target == 0) {
+            speed_ctl.integral[side] = 0;
+            speed_ctl.duty[side] = 0;
+            set_motor(side, 0);
+            continue;
+        }
+
+        float error = (target - measured_cps[side]) * MM_PER_COUNT;   // mm/s, positive = too slow (forward)
+        float ff = ff_duty(side, target);                               // feedforward: the table's guess
+        float p = kp * error;                                           // P: push harder the further off we are
+        float duty = ff + p + speed_ctl.integral[side];
+
+        // anti windup: only let the I part grow if the duty isnt already maxed out in that direction.
+        // otherwise it keeps growing while the motor cant go any faster, and overshoots badly later
+        bool maxed_out = (duty >= 100 && error > 0) || (duty <= -100 && error < 0);
+        if (!maxed_out) {
+            speed_ctl.integral[side] += ki * error * dt;
+        }
+
+        if (duty > 100) duty = 100;
+        if (duty < -100) duty = -100;
+        speed_ctl.duty[side] = duty;
+        set_motor(side, duty);
+    }
 }
 
 // longest one motor_task tick has taken since the last step test started, in microseconds
@@ -219,6 +314,7 @@ static void step_start(bool speed, int value, int duration_ms)
     if (duration_ms > 10000) duration_ms = 10000;
 
     speed_ctl.active = false;
+    speed_reset_integral();   // start the speed test with no leftover correction
     motors_stop();
     motors_enable(true);
     step.active = true;
@@ -239,10 +335,12 @@ static void step_update(void)
     uint32_t run_end = STEP_PRE_MS + step.duration_ms;
     bool running = t > STEP_PRE_MS && t <= run_end;
 
-    if (running && step.speed) { // every millisecond of the run
+    if (running && step.speed) { // speed test: run the speed control every CONTROL_PERIOD_MS of the run
         speed_ctl.target_cps[ENC_LEFT] = mm_s_to_cps(step.value);
         speed_ctl.target_cps[ENC_RIGHT] = mm_s_to_cps(step.value);
-        speed_update();
+        if (control_due()) {
+            speed_update();
+        }
     } else if (t == STEP_PRE_MS + 1) { // duty test (step) only once
         // if it's the ms after the pre phase, moment run should start
         set_motor(ENC_LEFT, step.value);
@@ -253,12 +351,9 @@ static void step_update(void)
     }
 
     if (t % STEP_LOG_MS == 0) {
-        int32_t left = encoder_count(ENC_LEFT);
-        int32_t right = encoder_count(ENC_RIGHT);
-        long left_speed = (long)(left - step.last_count[ENC_LEFT]) * 1000 / STEP_LOG_MS;
-        long right_speed = (long)(right - step.last_count[ENC_RIGHT]) * 1000 / STEP_LOG_MS;
-        step.last_count[ENC_LEFT] = left;
-        step.last_count[ENC_RIGHT] = right;
+        // same ~20 ms real time speed the PI uses, so the plot shows exactly what the controller saw
+        long left_speed = lroundf(measured_cps[ENC_LEFT]);
+        long right_speed = lroundf(measured_cps[ENC_RIGHT]);
 
         if (step.speed) {
             left_speed = lroundf(left_speed * MM_PER_COUNT);
@@ -266,7 +361,15 @@ static void step_update(void)
         }
 
         char msg[MSG_LEN];
-        snprintf(msg, sizeof(msg), "log %lu %d %ld %ld", (unsigned long)t, running ? step.value : 0, left_speed, right_speed);
+        if (step.speed) {
+            // speed tests also send the duty the controller chose, so tune.py can show the PI working
+            float left_duty = running ? speed_ctl.duty[ENC_LEFT] : 0;
+            float right_duty = running ? speed_ctl.duty[ENC_RIGHT] : 0;
+            snprintf(msg, sizeof(msg), "log %lu %d %ld %ld %.1f %.1f", (unsigned long)t, running ? step.value : 0,
+                     left_speed, right_speed, left_duty, right_duty);
+        } else {
+            snprintf(msg, sizeof(msg), "log %lu %d %ld %ld", (unsigned long)t, running ? step.value : 0, left_speed, right_speed);
+        }
         comms_send(msg);
     }
 
@@ -286,13 +389,40 @@ static void step_update(void)
 //   v <mm/s>           drive at a speed using the feedforward table (one number = both wheels, two = left right)
 //   o <duty%> <ms>     duty step test for tune.py (any other command cancels it)
 //   p <mm/s> <ms>      speed step test for tune.py's vstep
+//   kp <x>, ki <x>     set a PI gain (doesnt stop the motors)
+//   show               reply with the PI gains
 static void handle_command(const char *cmd)
 {
     char reply[MSG_LEN];
+
+    // gain commands first: they only change a number, so they dont stop whatever is running.
+    // "show" has to be checked before "s" (stop) since it also starts with s
+    float gain;
+    if (strncmp(cmd, "kp", 2) == 0 || strncmp(cmd, "ki", 2) == 0) {
+        if (sscanf(cmd + 2, "%f", &gain) == 1 && gain >= 0) {
+            if (cmd[1] == 'p') {
+                kp = gain;
+            } else {
+                ki = gain;
+            }
+            snprintf(reply, sizeof(reply), "kp %.4f  ki %.4f", kp, ki);
+        } else {
+            snprintf(reply, sizeof(reply), "usage: kp 0.05  or  ki 0.5  (0 or more)");
+        }
+        comms_send(reply);
+        return;
+    }
+    if (strcmp(cmd, "show") == 0) {
+        snprintf(reply, sizeof(reply), "kp %.4f  ki %.4f", kp, ki);
+        comms_send(reply);
+        return;
+    }
+
     int left = 0, right = 0;
-    int n = sscanf(cmd + 1, "%d %d", &left, &right); // n = numbers in the command 
+    int n = sscanf(cmd + 1, "%d %d", &left, &right); // n = numbers in the command
 
     // a new command always takes over from a step test or speed mode that's still running
+    bool was_speed_mode = speed_ctl.active;
     step.active = false;
     speed_ctl.active = false;
 
@@ -308,12 +438,21 @@ static void handle_command(const char *cmd)
     if (n == 1) right = left;
 
     if (cmd[0] == 'v' && n >= 1) {
-        speed_ctl.target_cps[ENC_LEFT] = mm_s_to_cps(left);
-        speed_ctl.target_cps[ENC_RIGHT] = mm_s_to_cps(right);
-        speed_ctl.active = true;
-        speed_update();
+        float new_left = mm_s_to_cps(left);
+        float new_right = mm_s_to_cps(right);
+
+        // keep the I part when just changing speed (it's mostly correcting battery/friction, still useful).
+        // start it fresh when speed mode was off or a wheel changes direction
+        bool flipped = (new_left * speed_ctl.target_cps[ENC_LEFT] < 0) || (new_right * speed_ctl.target_cps[ENC_RIGHT] < 0);
+        if (!was_speed_mode || flipped) {
+            speed_reset_integral();
+        }
+
+        speed_ctl.target_cps[ENC_LEFT] = new_left;
+        speed_ctl.target_cps[ENC_RIGHT] = new_right;
+        speed_ctl.active = true;   // motor_task's next control tick (within 5 ms) starts driving
         motors_enable(true);
-        snprintf(reply, sizeof(reply), "speed set to L=%d R=%d mm/s (duty L=%.1f%% R=%.1f%%)", left, right,
+        snprintf(reply, sizeof(reply), "speed set to L=%d R=%d mm/s (starting duty L=%.1f%% R=%.1f%%)", left, right,
                  ff_duty(ENC_LEFT, speed_ctl.target_cps[ENC_LEFT]), ff_duty(ENC_RIGHT, speed_ctl.target_cps[ENC_RIGHT]));
     } else if (cmd[0] == 'd' && n >= 1) {
         set_motor(ENC_LEFT, left);
@@ -405,7 +544,9 @@ static void motor_task(void *arg)
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         esp_task_wdt_reset();
         int64_t loop_start = esp_timer_get_time();
+        motor_ticks++;
 
+        speed_measure();   // update each wheel's measured speed every tick, the PI needs it fresh
         tof_latest(&tof);
 
         // receive takes it out of the mailbox so we never run the same command twice
@@ -416,7 +557,7 @@ static void motor_task(void *arg)
 
         if (step.active) {
             step_update();
-        } else if (speed_ctl.active) {
+        } else if (speed_ctl.active && control_due()) {
             speed_update();
         }
 

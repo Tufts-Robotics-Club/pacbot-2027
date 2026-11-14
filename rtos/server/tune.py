@@ -89,8 +89,9 @@ def run_step(value, duration_ms, speed=False):
         if line == "log done":
             break
         parts = line.split()
-        if len(parts) == 5:
-            rows.append([int(p) for p in parts[1:]])
+        # duty steps send 4 numbers, speed steps send 6 (the last two are the duty the PI chose)
+        if len(parts) in (5, 7):
+            rows.append([float(p) for p in parts[1:]])
     else:
         print("test didnt finish (cancelled or lost connection), plotting what came in")
 
@@ -104,7 +105,7 @@ def run_step(value, duration_ms, speed=False):
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         if speed:
-            w.writerow(["t_ms", "target_mm_per_s", "left_mm_per_s", "right_mm_per_s"])
+            w.writerow(["t_ms", "target_mm_per_s", "left_mm_per_s", "right_mm_per_s", "left_duty", "right_duty"][:len(rows[0])])
         else:
             w.writerow(["t_ms", "duty", "left_counts_per_s", "right_counts_per_s"])
         w.writerows(rows)
@@ -142,16 +143,31 @@ def plot(rows, title, png_path):
 
 def plot_speed(rows, title, png_path):
     t = [r[0] for r in rows]
-    fig, ax = plt.subplots(figsize=(9, 5))
-    # each sample covers the 20 ms before it, so the target is drawn over that interval too
+    has_duty = len(rows[0]) >= 6   # newer firmware also sends the duty the PI chose
+    if has_duty:
+        fig, (ax, duty_ax) = plt.subplots(2, 1, figsize=(9, 7), sharex=True, gridspec_kw={"height_ratios": [2, 1]})
+    else:
+        fig, ax = plt.subplots(figsize=(9, 5))
+
+    # top: target vs measured speed. each sample covers the 20 ms before it, so the target is drawn over that interval too
     ax.step(t, [r[1] for r in rows], where="pre", color="gray", linestyle="--", label="target speed")
     ax.plot(t, [r[2] for r in rows], label="left speed")
     ax.plot(t, [r[3] for r in rows], label="right speed")
-    ax.set_xlabel("time (ms)")
     ax.set_ylabel("speed (mm/s)")
     ax.grid(True, alpha=0.3)
     ax.legend(loc="upper right")
     ax.set_title(title)
+
+    # bottom: the duty the controller sent each motor (feedforward + PI correction)
+    if has_duty:
+        duty_ax.plot(t, [r[4] for r in rows], label="left duty")
+        duty_ax.plot(t, [r[5] for r in rows], label="right duty")
+        duty_ax.set_ylabel("duty (%)")
+        duty_ax.set_xlabel("time (ms)")
+        duty_ax.grid(True, alpha=0.3)
+        duty_ax.legend(loc="upper right")
+    else:
+        ax.set_xlabel("time (ms)")
     fig.tight_layout()
     fig.savefig(png_path, dpi=120)
     print(f"saved plot to {png_path}")
