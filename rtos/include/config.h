@@ -51,13 +51,14 @@
 
 // motors on the L293D. left and right are swapped from the arduino encoder test
 // EN is the master on/off (low = both outputs off, motor coasts)
-// PWM goes on IN1/IN2: forward = PWM on IN2 with IN1 low, backward = the other way, both low = brake
+// PWM goes on the A inputs (1A/2A for the left motor, 3A/4A for the right). forward = PWM on 2A/4A with
+// 1A/3A low, backward = the other way, both low = brake
 #define LEFT_EN       25   // L293D pin 1 (1,2EN), 12k pull down
-#define LEFT_IN1      26   // L293D pin 2 (1A)
-#define LEFT_IN2      27   // L293D pin 7 (2A)
+#define LEFT_1A       26   // L293D pin 2 (1A)
+#define LEFT_2A       27   // L293D pin 7 (2A)
 #define RIGHT_EN      23   // L293D pin 9 (3,4EN), 12k pull down
-#define RIGHT_IN1     19   // L293D pin 10 (3A)
-#define RIGHT_IN2     18   // L293D pin 15 (4A)
+#define RIGHT_3A      19   // L293D pin 10 (3A)
+#define RIGHT_4A      18   // L293D pin 15 (4A)
 #define MOTOR_PWM_HZ  300  // same as the arduino version, the L293D is slow so keep this low
 
 // motor encoders, same pins as the arduino encoder test
@@ -71,3 +72,11 @@
 #define PRINT_ENC     0        // prints encoder counts to usb serial, set to 0 once its working
 #define SEND_ENC      1        // sends encoder counts to the server (shows up in console.py as "robot: enc ...")
 #define ENC_REPORT_HZ 5        // how often the counts get printed/sent
+
+// robot geometry, prototype chassis. redo on the real chassis
+// counts per wheel turn = 12 per motor turn x 75.81:1 gearbox (hand test gave 906-909)
+#define COUNTS_PER_REV  909.7f
+#define WHEEL_DIAM_MM   34.0f    // pololu spec (calipers read 33), fine tune later with a 1 m drive test
+#define TRACK_WIDTH_MM  152.9f   // tire center to tire center, ruler. fine tune later with a gyro spin test
+#define MM_PER_COUNT    (3.14159265f * WHEEL_DIAM_MM / COUNTS_PER_REV)   // ~0.117 mm
+#define CELL_MM         (3.5f * 25.4f)   // one maze grid cell is 3.5 in = 88.9 mm
