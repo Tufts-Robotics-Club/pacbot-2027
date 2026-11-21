@@ -293,7 +293,7 @@ class ConsoleApp(App):
             await send_to_bot(command)
 
     async def action_stop(self):
-        await send_to_bot("s")
+        await send_to_bot("0")  # "s" is south now
 
     async def action_off(self):
         await send_to_bot("x")
