@@ -4,7 +4,6 @@
 # keys: F1 stop (brake), F2 motors off (coast), ctrl+l clear log, ctrl+q quit
 
 import asyncio
-import json
 
 import config
 import logger
@@ -14,7 +13,18 @@ from logger import (
     print_cv_message,
     print_sent_message,
 )
-from messages import RegistrationRequestMessage, RegistrationResponseMessage
+from commands import USAGE, parse_command
+from messages import (
+    BaseMessage,
+    EncodersMessage,
+    ErrorMessage,
+    ImuMessage,
+    InfoMessage,
+    RegistrationRequestMessage,
+    RegistrationResponseMessage,
+    StopMessage,
+    parse_message,
+)
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -30,10 +40,10 @@ CV_ID = config.CLIENT_IDS["cv"]
 connected_clients = {}
 
 # high rate telemetry goes to the panel instead of the log so the log stays readable
-latest_imu = None  # newest imu reading as a dict
+latest_imu: ImuMessage | None = None  # newest imu reading
 imu_count = 0  # imu messages since the last rate update
 imu_rate = 0  # imu messages per second
-latest_enc = None  # newest "enc L: .. R: .." line
+latest_enc: EncodersMessage | None = None  # newest encoder counts
 
 
 async def handle_connection(websocket):
@@ -133,52 +143,55 @@ async def handle_connection(websocket):
             print_server_message(f"Client {client_id} disconnected")
 
 
-# returns True if raw was imu/encoder telemetry and got stored for the panel
-def handle_bot_telemetry(raw):
+# decodes a message from the bot and sends it wherever that type belongs
+def handle_bot_message(raw):
     global latest_imu, imu_count, latest_enc
 
-    if raw.startswith("{"):
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            return False
-        if isinstance(data, dict) and "a" in data and "g" in data:
-            latest_imu = data
+    try:
+        message = parse_message(raw)
+    except ValueError as e:
+        print_server_message(f"Couldn't read bot message ({e}): {raw}")
+        return
+
+    match message:
+        # high rate telemetry goes to the panel instead of the log
+        case ImuMessage():
+            latest_imu = message
             imu_count += 1
-            return True
-        return False
-
-    if raw.startswith("enc "):
-        latest_enc = raw
-        return True
-
-    return False
+        case EncodersMessage():
+            latest_enc = message
+        case InfoMessage():
+            print_bot_message(message.message)
+        case ErrorMessage():
+            print_bot_message(f"error: {message.message}")
+        case _:
+            # step logs etc. show up as their json
+            print_bot_message(message.to_json())
 
 
 async def process_message(client_id, raw):
-    # TODO: Parse and route messages.
-
     role = config.ROLE_BY_CLIENT_ID.get(client_id)
 
     if role == "bot":
-        if not handle_bot_telemetry(raw):
-            print_bot_message(raw)
+        handle_bot_message(raw)
 
     elif role == "cv":
+        # TODO: give the cv messages their own types too
         print_cv_message(raw)
 
     else:
         print_server_message(f"Message from unknown client {client_id}: {raw}")
 
 
-async def send_to_bot(command):
+async def send_to_bot(message: BaseMessage):
     bot = connected_clients.get(BOT_ID)
     if bot is None:
         print_server_message("No robot connected, command not sent")
         return
+    raw = message.to_json()
     try:
-        await bot.send(command)
-        print_sent_message(command)
+        await bot.send(raw)
+        print_sent_message(raw)
     except ConnectionClosed:
         print_server_message("Robot disconnected, command not sent")
 
@@ -211,7 +224,7 @@ class ConsoleApp(App):
         yield Static(id="status")
         yield Static(id="telemetry")
         yield RichLog(id="log", wrap=True, max_lines=5000)
-        yield Input(placeholder="command → robot   d <duty> [right] | s | x")
+        yield Input(placeholder=f"command → robot   {USAGE}")
         yield Footer()
 
     def on_mount(self):
@@ -271,7 +284,7 @@ class ConsoleApp(App):
         if latest_imu is None:
             imu = Text("IMU  waiting for data", style="dim")
         else:
-            a, g = latest_imu["a"], latest_imu["g"]
+            a, g = latest_imu.a, latest_imu.g
             imu = Text(
                 f"IMU  {imu_rate:3d}/s   "
                 f"accel {a[0]:7.1f} {a[1]:7.1f} {a[2]:7.1f} mg   "
@@ -279,7 +292,7 @@ class ConsoleApp(App):
             )
 
         enc = (
-            Text(latest_enc.replace("enc", "ENC ", 1))
+            Text(f"ENC  L: {latest_enc.left}  R: {latest_enc.right}")
             if latest_enc
             else Text("ENC  waiting for data", style="dim")
         )
@@ -289,14 +302,20 @@ class ConsoleApp(App):
     async def on_input_submitted(self, event: Input.Submitted):
         command = event.value.strip()
         event.input.value = ""
-        if command:
-            await send_to_bot(command)
+        if not command:
+            return
+        try:
+            message = parse_command(command)
+        except ValueError as e:
+            print_server_message(str(e))
+            return
+        await send_to_bot(message)
 
     async def action_stop(self):
-        await send_to_bot("0")  # "s" is south now
+        await send_to_bot(StopMessage(coast=False))
 
     async def action_off(self):
-        await send_to_bot("x")
+        await send_to_bot(StopMessage(coast=True))
 
     def action_clear_log(self):
         self.log_view.clear()

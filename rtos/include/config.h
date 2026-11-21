@@ -25,9 +25,9 @@
 #define STACK_MOTOR   4096   // sscanf/snprintf for the motor commands need more than 2048
 #define STACK_TOF     3072
 #define STACK_IMU     3072
-#define STACK_REPLY   2048
+#define STACK_REPLY   4096   // makes the json with cJSON
 #define STACK_STATS   3072   // printing floats takes more stack
-#define STACK_IMU_SEND 3072  // same reason
+#define STACK_IMU_SEND 4096  // printing floats + cJSON
 
 #define MOTOR_HZ      1000
 #define TOF_HZ        100
@@ -45,7 +45,7 @@
 #define SEND_IMU      1        // sends imu readings to the server
 #define IMU_SEND_HZ   50       // same 50 Hz as the club's imu code
 
-#define MSG_LEN       128      // longest message to or from the computer (imu json is ~70)
+#define MSG_LEN       256      // longest json message to or from the computer (imu json is ~90)
 
 #define NUM_TOF       4        // one wall sensor per side
 

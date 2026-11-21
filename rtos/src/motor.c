@@ -21,7 +21,7 @@
 #include "comms.h"
 #include "tof.h"
 
-// size 1 so a new command replaces the old one
+// holds one motor_cmd_t. size 1 so a new command replaces the old one
 static QueueHandle_t cmd_mailbox;
 
 static TaskHandle_t motor_task_handle;
@@ -36,15 +36,6 @@ static const ledc_channel_t first_input_channels[2] = {LEDC_CHANNEL_0, LEDC_CHAN
 static const ledc_channel_t second_input_channels[2] = {LEDC_CHANNEL_2, LEDC_CHANNEL_3};
 
 #define PWM_MAX 1023  // 10 bit duty so the speed control can make steps smaller than 1%
-
-// board directions, in clockwise order so +1 is a 90 deg cw turn and -1 is a 90 deg ccw turn
-typedef enum {
-    NORTH,  // 0
-    EAST,   // 1
-    SOUTH,  // 2
-    WEST,   // 3
-    NO_DIR  // not a direction command
-} dir_t;
 
 static dir_t facing = NORTH;  // assume we start facing north
 
@@ -301,9 +292,9 @@ static void speed_update(void)
 static int64_t loop_us_max; //basically just for debugging, doesn't really control motor functionality
 
 // step tests for tune.py: brake for STEP_PRE_MS, run both wheels for duration_ms, then brake for STEP_POST_MS
-//   duty step  (o): fixed duty. every STEP_LOG_MS sends "log <t_ms> <duty%> <left counts/s> <right counts/s>"
-//   speed step (p): speed mode at a target. sends "log <t_ms> <target mm/s> <left mm/s> <right mm/s>"
-// and "log done" at the end
+//   duty step:  fixed duty. every STEP_LOG_MS sends a step_log message {t, value: duty %, left/right: counts/s}
+//   speed step: speed mode at a target. step_log {t, value: target mm/s, left/right: mm/s, left/right_duty}
+// and a step_done message at the end
 #define STEP_PRE_MS   200   // motors stay braked for 200 ms before the run starts, to make sure wheels are fully stopped
 #define STEP_POST_MS  500   // after run motors brake for 500 ms while logging continues
 #define STEP_LOG_MS   20    // 50 Hz, one speed sample per log line
@@ -371,25 +362,26 @@ static void step_update(void)
             right_speed = lroundf(right_speed * MM_PER_COUNT);
         }
 
-        char msg[MSG_LEN];
-        if (step.speed) {
-            // speed tests also send the duty the controller chose, so tune.py can show the PI working
-            float left_duty = running ? speed_ctl.duty[ENC_LEFT] : 0;
-            float right_duty = running ? speed_ctl.duty[ENC_RIGHT] : 0;
-            snprintf(msg, sizeof(msg), "log %lu %d %ld %ld %.1f %.1f", (unsigned long)t, running ? step.value : 0,
-                     left_speed, right_speed, left_duty, right_duty);
-        } else {
-            snprintf(msg, sizeof(msg), "log %lu %d %ld %ld", (unsigned long)t, running ? step.value : 0, left_speed, right_speed);
-        }
-        comms_send(msg);
+        bot_msg_t msg = {
+            .type = BOT_MSG_STEP_LOG,
+            .step_log = {
+                .t_ms = t,
+                .value = running ? step.value : 0,
+                .left = left_speed,
+                .right = right_speed,
+                // speed tests also send the duty the controller chose, so tune.py can show the PI working
+                .has_duty = step.speed,
+                .left_duty = (step.speed && running) ? speed_ctl.duty[ENC_LEFT] : 0,
+                .right_duty = (step.speed && running) ? speed_ctl.duty[ENC_RIGHT] : 0,
+            },
+        };
+        comms_send(&msg);
     }
 
     if (t >= run_end + STEP_POST_MS) {
         step.active = false;
-        char msg[MSG_LEN];
-        snprintf(msg, sizeof(msg), "slowest motor loop during the test: %ld us (has to stay under 1000)", (long)loop_us_max);
-        comms_send(msg);
-        comms_send("log done");
+        comms_send_info("slowest motor loop during the test: %ld us (has to stay under 1000)", (long)loop_us_max);
+        comms_send(&(bot_msg_t){ .type = BOT_MSG_STEP_DONE });
     }
 }
 
@@ -496,10 +488,8 @@ static void turn_update(void)
     float avg_counts = (moved[ENC_LEFT] + moved[ENC_RIGHT]) / 2.0f;
     float actual_deg = avg_counts * MM_PER_COUNT / (3.14159265f * TRACK_WIDTH_MM) * 360.0f;
     int32_t coast = lroundf(avg_counts) - (turn.target_counts + TURN_COAST_COUNTS);
-    char msg[MSG_LEN];
-    snprintf(msg, sizeof(msg), "turn done: asked %.1f deg, wheels say %.1f deg (L=%ld R=%ld counts, %+ld past target)",
-             turn.degrees, actual_deg, (long)moved[ENC_LEFT], (long)moved[ENC_RIGHT], (long)coast);
-    comms_send(msg);
+    comms_send_info("turn done: asked %.1f deg, wheels say %.1f deg (L=%ld R=%ld counts, %+ld past target)",
+                    turn.degrees, actual_deg, (long)moved[ENC_LEFT], (long)moved[ENC_RIGHT], (long)coast);
 
     // the turn was the first half of an n/s/e/w command: now drive off the way we're facing
     if (turn.then_drive) {
@@ -507,123 +497,81 @@ static void turn_update(void)
     }
 }
 
-// commands from console.py, same as the arduino version. one number = both wheels, two = left right
-//   d <duty%>          open loop duty, -100..100 (turns the motors back on if x turned them off)
-//   0 or stop          stop with the brake (s is south now)
-//   n / s / e / w      go that way on the board at DRIVE_SPEED_MM_S, turning 90 first if needed (opposite = reverse)
-//   x                  master off, EN low so the motors coast
-//   v <mm/s>           drive at a speed using the feedforward table (one number = both wheels, two = left right)
-//   o <duty%> <ms>     duty step test for tune.py (any other command cancels it)
-//   p <mm/s> <ms>      speed step test for tune.py's vstep
-//   tcw <deg> [mm/s]   turn clockwise in place by deg degrees, then brake (default 100 mm/s wheel speed)
-//   tccw <deg> [mm/s]  same, counter clockwise
-//   kp <x>, ki <x>     set a PI gain (doesnt stop the motors)
-//   show               reply with the PI gains
-static void handle_command(const char *cmd)
+// n / s / e / w on the board at DRIVE_SPEED_MM_S, turning 90 first if needed (opposite = reverse)
+static void go_direction(dir_t want, bool was_speed_mode)
 {
-    char reply[MSG_LEN];
+    // how many 90 deg cw steps from where we face to where we want to go, wrapped into 0..3
+    int diff = ((want - facing) % 4 + 4) % 4;
+    if (diff == 0) {
+        // already facing it
+        drive_straight(DRIVE_SPEED_MM_S, was_speed_mode);
+        comms_send_info("going %c: forward (facing %c)", "NESW"[want], "NESW"[facing]);
+    } else if (diff == 2) {
+        // it's right behind us: reverse instead of turning 180. facing does NOT change, the front still points
+        // the same way, we're just rolling backward
+        drive_straight(-DRIVE_SPEED_MM_S, was_speed_mode);
+        comms_send_info("going %c: backward (facing %c)", "NESW"[want], "NESW"[facing]);
+    } else {
+        // diff 1 = it's 90 cw of us, diff 3 = 90 ccw. turn, then turn_update drives forward when it's done
+        bool clockwise = diff == 1;
+        turn_start(clockwise, 90, 0);
+        turn.then_drive = true;
+        // set now rather than when the turn ends so the next command is worked out from the new way.
+        // TODO: if another command interrupts the turn half way, the bot is really pointing somewhere in between
+        facing = want;
+        comms_send_info("going %c: turning %s 90 then forward (facing %c)", "NESW"[want],
+                        clockwise ? "cw" : "ccw", "NESW"[facing]);
+    }
+}
 
-    // gain commands first: they only change a number, so they dont stop whatever is running.
-    // "show" is checked here, before anything that looks at the first letter alone
-    float gain;
-    if (strncmp(cmd, "kp", 2) == 0 || strncmp(cmd, "ki", 2) == 0) {
-        if (sscanf(cmd + 2, "%f", &gain) == 1 && gain >= 0) {
-            if (cmd[1] == 'p') {
-                kp = gain;
-            } else {
-                ki = gain;
-            }
-            snprintf(reply, sizeof(reply), "kp %.4f  ki %.4f", kp, ki);
-        } else {
-            snprintf(reply, sizeof(reply), "usage: kp 0.05  or  ki 0.5  (0 or more)");
-        }
-        comms_send(reply);
+// runs one command from the server. comms.c already turned the json into a motor_cmd_t (see messages.c),
+// so all we do here is switch on its type and read the matching member of the union
+static void handle_command(const motor_cmd_t *cmd)
+{
+    // gain commands only change a number, so they dont stop whatever is running
+    if (cmd->type == MOTOR_CMD_GAINS) {
+        if (cmd->gains.has_kp) kp = cmd->gains.kp;
+        if (cmd->gains.has_ki) ki = cmd->gains.ki;
+        comms_send_info("kp %.4f  ki %.4f", kp, ki);
         return;
     }
-    if (strcmp(cmd, "show") == 0) {
-        snprintf(reply, sizeof(reply), "kp %.4f  ki %.4f", kp, ki);
-        comms_send(reply);
-        return;
-    }
 
-    // a new command always takes over from a step test, turn or speed mode that's still running
+    // every other command takes over from a step test, turn or speed mode that's still running
     bool was_speed_mode = speed_ctl.active && !turn.active;
     step.active = false;
     turn.active = false;
     speed_ctl.active = false;
 
-    // tcw / tccw (checked before the one letter commands so "tcw" isnt read as something else)
-    bool cw = strncmp(cmd, "tcw", 3) == 0;
-    bool ccw = strncmp(cmd, "tccw", 4) == 0;
-    if (cw || ccw) {
-        float degrees = 0, speed_mm_s = 0;
-        if (sscanf(cmd + (cw ? 3 : 4), "%f %f", &degrees, &speed_mm_s) >= 1) {
-            turn_start(cw, degrees, speed_mm_s);
-            snprintf(reply, sizeof(reply), "turning %s %.1f deg (%ld counts per wheel)", cw ? "cw" : "ccw",
-                     turn.degrees, (long)turn.target_counts);
+    switch (cmd->type) {
+    case MOTOR_CMD_STOP:
+        motors_stop();
+        if (cmd->stop.coast) {
+            motors_enable(false);   // EN low so the motors coast
+            comms_send_info("motors off");
         } else {
-            motors_stop();
-            snprintf(reply, sizeof(reply), "usage: tcw 90  or  tccw 90  (optional wheel speed: tcw 90 150)");
+            comms_send_info("stopped");
         }
-        comms_send(reply);
-        return;
-    }
+        break;
 
-    // n / s / e / w: only counts when the whole command is that one letter, so "stop" isnt read as south
-    dir_t want = NO_DIR;
-    if (cmd[1] == '\0') {
-        switch (cmd[0]) {
-            case 'n': want = NORTH; break;
-            case 'e': want = EAST;  break;
-            case 's': want = SOUTH; break;
-            case 'w': want = WEST;  break;
-            default:  break;
-        }
-    }
-    if (want != NO_DIR) {
-        // how many 90 deg cw steps from where we face to where we want to go, wrapped into 0..3
-        int diff = ((want - facing) % 4 + 4) % 4;
-        if (diff == 0) {
-            // already facing it
-            drive_straight(DRIVE_SPEED_MM_S, was_speed_mode);
-            snprintf(reply, sizeof(reply), "going %c: forward (facing %c)", "NESW"[want], "NESW"[facing]);
-        } else if (diff == 2) {
-            // it's right behind us: reverse instead of turning 180. facing does NOT change, the front still points
-            // the same way, we're just rolling backward
-            drive_straight(-DRIVE_SPEED_MM_S, was_speed_mode);
-            snprintf(reply, sizeof(reply), "going %c: backward (facing %c)", "NESW"[want], "NESW"[facing]);
-        } else {
-            // diff 1 = it's 90 cw of us, diff 3 = 90 ccw. turn, then turn_update drives forward when it's done
-            bool clockwise = diff == 1;
-            turn_start(clockwise, 90, 0);
-            turn.then_drive = true;
-            // set now rather than when the turn ends so the next command is worked out from the new way.
-            // TODO: if another command interrupts the turn half way, the bot is really pointing somewhere in between
-            facing = want;
-            snprintf(reply, sizeof(reply), "going %c: turning %s 90 then forward (facing %c)", "NESW"[want],
-                     clockwise ? "cw" : "ccw", "NESW"[facing]);
-        }
-        comms_send(reply);
-        return;
-    }
+    case MOTOR_CMD_DIRECTION:
+        go_direction(cmd->direction, was_speed_mode);
+        break;
 
-    int left = 0, right = 0;
-    int n = sscanf(cmd + 1, "%d %d", &left, &right); // n = numbers in the command
+    case MOTOR_CMD_TURN:
+        turn_start(cmd->turn.clockwise, cmd->turn.degrees, cmd->turn.speed_mm_s);
+        comms_send_info("turning %s %.1f deg (%ld counts per wheel)", cmd->turn.clockwise ? "cw" : "ccw",
+                        turn.degrees, (long)turn.target_counts);
+        break;
 
-    if ((cmd[0] == 'o' || cmd[0] == 'p') && n >= 1) {
-        bool speed = cmd[0] == 'p';
-        int duration_ms = (n == 2) ? right : 1000;
-        step_start(speed, left, duration_ms);
-        snprintf(reply, sizeof(reply), "step test: %d %s for %d ms", left, speed ? "mm/s" : "%", duration_ms);
-        comms_send(reply);
-        return;
-    }
+    case MOTOR_CMD_STEP_TEST:
+        step_start(cmd->step.speed, cmd->step.value, cmd->step.duration_ms);
+        comms_send_info("step test: %d %s for %d ms", cmd->step.value, cmd->step.speed ? "mm/s" : "%",
+                        cmd->step.duration_ms);
+        break;
 
-    if (n == 1) right = left;
-
-    if (cmd[0] == 'v' && n >= 1) {
-        float new_left = mm_s_to_cps(left);
-        float new_right = mm_s_to_cps(right);
+    case MOTOR_CMD_SPEED: {
+        float new_left = mm_s_to_cps(cmd->speed.left);
+        float new_right = mm_s_to_cps(cmd->speed.right);
 
         // keep the I part when just changing speed (it's mostly correcting battery/friction, still useful).
         // start it fresh when speed mode was off or a wheel changes direction
@@ -636,24 +584,21 @@ static void handle_command(const char *cmd)
         speed_ctl.target_cps[ENC_RIGHT] = new_right;
         speed_ctl.active = true;   // motor_task's next control tick (within 5 ms) starts driving
         motors_enable(true);
-        snprintf(reply, sizeof(reply), "speed set to L=%d R=%d mm/s (starting duty L=%.1f%% R=%.1f%%)", left, right,
-                 ff_duty(ENC_LEFT, speed_ctl.target_cps[ENC_LEFT]), ff_duty(ENC_RIGHT, speed_ctl.target_cps[ENC_RIGHT]));
-    } else if (cmd[0] == 'd' && n >= 1) {
-        set_motor(ENC_LEFT, left);
-        set_motor(ENC_RIGHT, right);
-        motors_enable(true);
-        snprintf(reply, sizeof(reply), "duty set to L=%d%% R=%d%%", left, right);
-    } else if (cmd[0] == '0' || strcmp(cmd, "stop") == 0) {
-        motors_stop();
-        snprintf(reply, sizeof(reply), "stopped");
-    } else if (cmd[0] == 'x') {
-        motors_stop();
-        motors_enable(false);
-        snprintf(reply, sizeof(reply), "motors off");
-    } else {
-        snprintf(reply, sizeof(reply), "unknown command: %.100s", cmd);
+        comms_send_info("speed set to L=%d R=%d mm/s (starting duty L=%.1f%% R=%.1f%%)", cmd->speed.left,
+                        cmd->speed.right, ff_duty(ENC_LEFT, new_left), ff_duty(ENC_RIGHT, new_right));
+        break;
     }
-    comms_send(reply);
+
+    case MOTOR_CMD_DUTY:
+        set_motor(ENC_LEFT, cmd->duty.left);
+        set_motor(ENC_RIGHT, cmd->duty.right);
+        motors_enable(true);
+        comms_send_info("duty set to L=%d%% R=%d%%", cmd->duty.left, cmd->duty.right);
+        break;
+
+    case MOTOR_CMD_GAINS:
+        break;   // handled above
+    }
 }
 
 // timer interrupt every 1 ms that wakes up motor_task
@@ -696,15 +641,16 @@ static void motor_timer_start(void)
 static void enc_report_task(void *arg)
 {
     TickType_t last_wake = xTaskGetTickCount();
-    char msg[MSG_LEN];
+    bot_msg_t msg = { .type = BOT_MSG_ENCODERS };
     while (1) {
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(1000 / ENC_REPORT_HZ));
-        snprintf(msg, sizeof(msg), "enc L: %ld  R: %ld", (long)encoder_count(ENC_LEFT), (long)encoder_count(ENC_RIGHT));
+        msg.encoders.left = encoder_count(ENC_LEFT);
+        msg.encoders.right = encoder_count(ENC_RIGHT);
         if (PRINT_ENC) {
-            printf("%s\n", msg);
+            printf("enc L: %ld  R: %ld\n", (long)msg.encoders.left, (long)msg.encoders.right);
         }
         if (SEND_ENC) {
-            comms_send(msg);   // dropped if were not connected
+            comms_send(&msg);   // dropped if were not connected
         }
     }
 }
@@ -721,7 +667,7 @@ static void motor_task(void *arg)
     ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
 
     tof_data_t tof = {0};
-    char cmd[MSG_LEN];
+    motor_cmd_t cmd;
 
     while (1) {
         // sleep until the timer wakes us up (from the ISR)
@@ -734,9 +680,8 @@ static void motor_task(void *arg)
         tof_latest(&tof);
 
         // receive takes it out of the mailbox so we never run the same command twice
-        if (xQueueReceive(cmd_mailbox, cmd, 0) == pdTRUE) {
-            // TODO: switch to whatever the ai sends once we know
-            handle_command(cmd);
+        if (xQueueReceive(cmd_mailbox, &cmd, 0) == pdTRUE) {
+            handle_command(&cmd);
         }
 
         if (step.active) {
@@ -759,13 +704,11 @@ static void motor_task(void *arg)
 
 void motor_start(void)
 {
-    cmd_mailbox = xQueueCreate(1, MSG_LEN);
+    cmd_mailbox = xQueueCreate(1, sizeof(motor_cmd_t));
     xTaskCreatePinnedToCore(motor_task, "motor", STACK_MOTOR, NULL, PRIO_MOTOR, &motor_task_handle, RT_CORE);
 }
 
-void motor_command(const char *text)
+void motor_command(const motor_cmd_t *cmd)
 {
-    char buf[MSG_LEN];
-    strlcpy(buf, text, sizeof(buf));
-    xQueueOverwrite(cmd_mailbox, buf);
+    xQueueOverwrite(cmd_mailbox, cmd);   // copies the struct in, so cmd can be a local in the caller
 }

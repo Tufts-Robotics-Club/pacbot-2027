@@ -5,7 +5,7 @@
 #                       then save tune_logs/step_<duty>_<time>.csv and show speed vs time
 #   vstep <mm/s> [ms]   same but the robot holds a target speed (speed control) instead of a fixed duty,
 #                       saves tune_logs/vstep_<speed>_<time>.csv and shows target vs measured speed
-#   anything else       sent to the robot as is (d 30, s, x ...)
+#   anything else       a console command (d 30, x, tcw 90 ...), see commands.py
 #   q                   quit
 
 import asyncio
@@ -19,12 +19,27 @@ import time
 import matplotlib.pyplot as plt
 from websockets.asyncio.server import serve
 
+from commands import parse_command
+from messages import (
+    BaseMessage,
+    EncodersMessage,
+    ErrorMessage,
+    ImuMessage,
+    InfoMessage,
+    RegistrationRequestMessage,
+    StepDoneMessage,
+    StepLogMessage,
+    StepMode,
+    StepTestMessage,
+    parse_message,
+)
+
 PORT = 8765
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tune_logs")
 
 robot = None            # the robots connection once it connects
 loop = None             # the websocket thread's event loop
-log_lines = queue.Queue()   # "log ..." lines from the robot, read by the main thread
+log_lines = queue.Queue()   # StepLogMessage/StepDoneMessage from the robot, read by the main thread
 
 
 async def handle_robot(ws):
@@ -32,13 +47,21 @@ async def handle_robot(ws):
     robot = ws
     print(f"\nrobot connected from {ws.remote_address[0]}")
     try:
-        async for msg in ws:
-            if msg.startswith("log"):
-                log_lines.put(msg)
-            elif msg.startswith("{") or msg.startswith("enc"):
-                pass    # imu and encoder counts would drown out everything else
-            else:
-                print(f"robot: {msg}")
+        async for raw in ws:
+            try:
+                msg = parse_message(raw)
+            except ValueError as e:
+                print(f"robot sent something unreadable ({e}): {raw}")
+                continue
+            match msg:
+                case StepLogMessage() | StepDoneMessage():
+                    log_lines.put(msg)
+                case ImuMessage() | EncodersMessage() | RegistrationRequestMessage():
+                    pass    # imu and encoder counts would drown out everything else
+                case InfoMessage() | ErrorMessage():
+                    print(f"robot: {msg.message}")
+                case _:
+                    print(f"robot: {raw}")
     except Exception as e:
         print(f"connection error: {e}")
     finally:
@@ -63,11 +86,11 @@ def start_server():
     threading.Thread(target=loop.run_until_complete, args=(serve_forever(),), daemon=True).start()
 
 
-def send(text):
+def send(message: BaseMessage):
     if robot is None:
         print("no robot connected yet")
         return False
-    asyncio.run_coroutine_threadsafe(robot.send(text), loop).result(timeout=2)
+    asyncio.run_coroutine_threadsafe(robot.send(message.to_json()), loop).result(timeout=2)
     return True
 
 
@@ -76,22 +99,24 @@ def run_step(value, duration_ms, speed=False):
     while not log_lines.empty():
         log_lines.get_nowait()
 
-    if not send(f"{'p' if speed else 'o'} {value} {duration_ms}"):
+    mode = StepMode.SPEED if speed else StepMode.DUTY
+    if not send(StepTestMessage(mode=mode, value=value, duration_ms=duration_ms)):
         return
 
     rows = []
     deadline = time.time() + (200 + duration_ms + 500) / 1000 + 3
     while time.time() < deadline:
         try:
-            line = log_lines.get(timeout=0.5)
+            msg = log_lines.get(timeout=0.5)
         except queue.Empty:
             continue
-        if line == "log done":
+        if isinstance(msg, StepDoneMessage):
             break
-        parts = line.split()
-        # duty steps send 4 numbers, speed steps send 6 (the last two are the duty the PI chose)
-        if len(parts) in (5, 7):
-            rows.append([float(p) for p in parts[1:]])
+        row = [msg.t, msg.value, msg.left, msg.right]
+        # speed steps also send the duty the PI chose
+        if msg.left_duty is not None and msg.right_duty is not None:
+            row += [msg.left_duty, msg.right_duty]
+        rows.append(row)
     else:
         print("test didnt finish (cancelled or lost connection), plotting what came in")
 
@@ -197,8 +222,14 @@ def main():
                 print("step is a duty in %, -100..100. did you mean vstep (speed in mm/s)?")
                 continue
             run_step(value, duration_ms, speed)
-        elif send(line):
-            print(f"sent: {line}")
+        else:
+            try:
+                message = parse_command(line)
+            except ValueError as e:
+                print(e)
+                continue
+            if send(message):
+                print(f"sent: {message.to_json()}")
 
 
 if __name__ == "__main__":

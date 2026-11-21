@@ -1,3 +1,4 @@
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -21,6 +22,7 @@
 #include "config.h"
 #include "comms.h"
 #include "imu.h"
+#include "messages.h"
 #include "motor.h"
 
 static const char *TAG = "pacbot";
@@ -29,13 +31,12 @@ static const char *TAG = "pacbot";
 // We connect out to the server on the laptop, same as the club's arduino client.
 static esp_websocket_client_handle_t client;
 
-// real queue for replies so none get lost
+// real queue for replies so none get lost. holds bot_msg_t structs, reply_task turns them into json
 static QueueHandle_t reply_queue;
 
 // The server drops us unless the registration is the first message on a new connection.
 // Nothing else gets sent until reply_task has sent it, so imu readings (which skip the
 // queue) or stale queued messages cant get there first. Cleared on every (dis)connect.
-static const char REGISTRATION_MSG[] = R"({"type":"registration","client_id":"1","role":"bot"})";
 static volatile bool registered = false;
 
 static EventGroupHandle_t wifi_events;
@@ -119,6 +120,33 @@ static const char *reset_reason_text(void)
     }
 }
 
+// works out what kind of message the server sent and passes it to whoever handles that kind
+static void handle_server_message(const char *json)
+{
+    server_msg_t msg;
+    char err[64];
+
+    if (!msg_parse(json, &msg, err, sizeof(err))) {
+        ESP_LOGW(TAG, "bad message from server: %s", err);
+        comms_send_error("bad message: %s", err);
+        return;
+    }
+
+    switch (msg.type) {
+    case SERVER_MSG_REGISTRATION_RESPONSE:
+        if (msg.registration_response.success) {
+            ESP_LOGI(TAG, "registered: %s", msg.registration_response.message);
+        } else {
+            ESP_LOGW(TAG, "registration refused: %s", msg.registration_response.message);
+        }
+        break;
+
+    case SERVER_MSG_MOTOR:
+        motor_command(&msg.motor);
+        break;
+    }
+}
+
 static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     esp_websocket_event_data_t *e = data;
@@ -135,23 +163,20 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
 
         // Register this ESP32 as a bot with client ID 1.
         // This has to be the first message or the server drops the connection.
-        comms_send(REGISTRATION_MSG);
+        comms_send(&(bot_msg_t){ .type = BOT_MSG_REGISTRATION });
 
         // Hello after registration so the server logs it as a normal bot message.
-        {
-            // a small "up" time = the chip just restarted (look at the reason).
-            // a big one = it stayed on and only the wifi connection dropped
-            char hello[MSG_LEN];
-            snprintf(hello, sizeof(hello), "Hello from ESP32! (last reset: %s, up %lld s)",
-                     reset_reason_text(), esp_timer_get_time() / 1000000);
-            comms_send(hello);
-        }
+        // a small "up" time = the chip just restarted (look at the reason).
+        // a big one = it stayed on and only the wifi connection dropped
+        comms_send_info("Hello from ESP32! (last reset: %s, up %lld s)",
+                        reset_reason_text(), esp_timer_get_time() / 1000000);
         break;
 
     case WEBSOCKET_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "disconnected from server, trying again in %d ms", WS_RECONNECT_MS);
         registered = false;
-        motor_command("x");   // turn the motors off so the robot doesnt keep driving with no one in control
+        // turn the motors off so the robot doesnt keep driving with no one in control
+        motor_command(&(motor_cmd_t){ .type = MOTOR_CMD_STOP, .stop = { .coast = true } });
         break;
 
     case WEBSOCKET_EVENT_DATA:
@@ -161,7 +186,7 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
             memcpy(buf, e->data_ptr, e->data_len);
             buf[e->data_len] = '\0';
             ESP_LOGI(TAG, "server says: %s", buf);
-            motor_command(buf);
+            handle_server_message(buf);
         }
         break;
 
@@ -193,17 +218,23 @@ static void ws_start(void)
 // until the registration has gone out, everything else is dropped (same as being disconnected)
 static void reply_task(void *arg)
 {
-    char msg[MSG_LEN];
+    bot_msg_t msg;
+    char json[MSG_LEN];
     while (1) {
-        xQueueReceive(reply_queue, msg, portMAX_DELAY);
+        xQueueReceive(reply_queue, &msg, portMAX_DELAY);
         if (!esp_websocket_client_is_connected(client)) {
             continue;
         }
-        bool is_registration = strcmp(msg, REGISTRATION_MSG) == 0;
+        bool is_registration = msg.type == BOT_MSG_REGISTRATION;
         if (!registered && !is_registration) {
             continue;
         }
-        int sent = esp_websocket_client_send_text(client, msg, strlen(msg), pdMS_TO_TICKS(100));
+        int len = msg_serialize(&msg, json, sizeof(json));
+        if (len < 0) {
+            ESP_LOGW(TAG, "message type %d didnt fit in %d bytes, dropped", msg.type, MSG_LEN);
+            continue;
+        }
+        int sent = esp_websocket_client_send_text(client, json, len, pdMS_TO_TICKS(100));
         // only flip once its actually on the wire. if it failed the server times us out
         // after 5 s and we reconnect and try again
         if (is_registration && sent >= 0) {
@@ -212,13 +243,14 @@ static void reply_task(void *arg)
     }
 }
 
-// sends the newest imu reading to the server in the same json as the club's imu code
-// {"t":ms,"a":[x,y,z],"g":[x,y,z]} with accel in mg and gyro in deg/s
+// sends the newest imu reading to the server in the same json as the club's imu code plus a type
+// {"type":"imu","t":ms,"a":[x,y,z],"g":[x,y,z]} with accel in mg and gyro in deg/s
 static void imu_send_task(void *arg)
 {
     TickType_t last_wake = xTaskGetTickCount();
-    char msg[MSG_LEN];
+    char json[MSG_LEN];
     imu_data_t d;
+    bot_msg_t msg = { .type = BOT_MSG_IMU };
 
     while (1) {
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(1000 / IMU_SEND_HZ));
@@ -227,17 +259,21 @@ static void imu_send_task(void *arg)
             continue;
         }
 
-        int len = snprintf(msg, sizeof(msg), "{\"t\":%lld,\"a\":[%.1f,%.1f,%.1f],\"g\":[%.2f,%.2f,%.2f]}",
-                           d.t_us / 1000,
-                           d.accel[0] * 1000, d.accel[1] * 1000, d.accel[2] * 1000,
-                           d.gyro[0], d.gyro[1], d.gyro[2]);
-        esp_websocket_client_send_text(client, msg, len, pdMS_TO_TICKS(20));
+        msg.imu.t_ms = d.t_us / 1000;
+        for (int i = 0; i < 3; i++) {
+            msg.imu.accel_mg[i] = d.accel[i] * 1000;
+            msg.imu.gyro_dps[i] = d.gyro[i];
+        }
+        int len = msg_serialize(&msg, json, sizeof(json));
+        if (len > 0) {
+            esp_websocket_client_send_text(client, json, len, pdMS_TO_TICKS(20));
+        }
     }
 }
 
 void comms_start(void)
 {
-    reply_queue = xQueueCreate(8, MSG_LEN);
+    reply_queue = xQueueCreate(8, sizeof(bot_msg_t));
     wifi_start();
     ws_start();
     xTaskCreatePinnedToCore(reply_task, "reply", STACK_REPLY, NULL, PRIO_REPLY, NULL, COMMS_CORE);
@@ -247,10 +283,31 @@ void comms_start(void)
     }
 }
 
-// just drops it in the queue so motor_task never has to touch the network
-void comms_send(const char *text)
+// just drops it in the queue so motor_task never has to touch the network or make json
+void comms_send(const bot_msg_t *msg)
 {
-    char buf[MSG_LEN];
-    strlcpy(buf, text, sizeof(buf));
-    xQueueSend(reply_queue, buf, 0);
+    xQueueSend(reply_queue, msg, 0);
+}
+
+static void send_text(bot_msg_type_t type, const char *fmt, va_list args)
+{
+    bot_msg_t msg = { .type = type };
+    vsnprintf(msg.text, sizeof(msg.text), fmt, args);
+    comms_send(&msg);
+}
+
+void comms_send_info(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    send_text(BOT_MSG_INFO, fmt, args);
+    va_end(args);
+}
+
+void comms_send_error(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    send_text(BOT_MSG_ERROR, fmt, args);
+    va_end(args);
 }
