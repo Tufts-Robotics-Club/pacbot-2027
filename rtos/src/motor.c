@@ -37,6 +37,17 @@ static const ledc_channel_t second_input_channels[2] = {LEDC_CHANNEL_2, LEDC_CHA
 
 #define PWM_MAX 1023  // 10 bit duty so the speed control can make steps smaller than 1%
 
+// board directions, in clockwise order so +1 is a 90 deg cw turn and -1 is a 90 deg ccw turn
+typedef enum {
+    NORTH,  // 0
+    EAST,   // 1
+    SOUTH,  // 2
+    WEST,   // 3
+    NO_DIR  // not a direction command
+} dir_t;
+
+static dir_t facing = NORTH;  // assume we start facing north
+
 // master on/off for both motors. off = L293D outputs float so the motors coast
 static void motors_enable(bool on)
 {
@@ -382,13 +393,130 @@ static void step_update(void)
     }
 }
 
+// ---------- driving straight ----------
+// both wheels at the same speed with the PI (negative = backward). was_driving = speed mode was already on,
+// so the I part is kept unless the wheels change direction (same idea as the v command)
+static void drive_straight(float mm_s, bool was_driving)
+{
+    float cps = mm_s_to_cps(mm_s);
+    bool flipped = (cps * speed_ctl.target_cps[ENC_LEFT] < 0) || (cps * speed_ctl.target_cps[ENC_RIGHT] < 0);
+    if (!was_driving || flipped) {
+        speed_reset_integral();
+    }
+    speed_ctl.target_cps[ENC_LEFT] = cps;
+    speed_ctl.target_cps[ENC_RIGHT] = cps;
+    speed_ctl.active = true;   // motor_task's next control tick starts driving
+    motors_enable(true);
+}
+
+// ---------- turning in place ----------
+// tcw 90 / tccw 90: spin in place by that many degrees, then brake.
+// in a spin each wheel rolls along a circle whose diameter is the track width, so for an angle
+// each wheel has to roll (angle / 360) x pi x TRACK_WIDTH_MM. 90 deg = ~120 mm = ~1020 counts per wheel.
+// it runs the normal speed control (one wheel forward, one backward) and checks the counts every 1 ms tick.
+// each wheel brakes on its own once it's done, then once both have stopped rolling it reports the real angle
+// so we can tune TRACK_WIDTH_MM and TURN_COAST_COUNTS
+#define TURN_SPEED_MM_S    100   // wheel speed while turning (tcw 90 150 to try a different one)
+#define DRIVE_SPEED_MM_S   200   // straight-line speed for n/s/e/w (try others with v first)
+#define TURN_COAST_COUNTS  0     // brake this many counts early to make up for coasting. set from tests
+#define TURN_SETTLE_MS     300   // after braking, wait at most this long for the wheels to stop before reporting
+
+static struct {
+    bool active;
+    bool braking;            // both wheels reached their target and are braked, waiting to settle
+    int dir[2];              // +1 = this wheel goes forward, -1 = backward (cw: left +1, right -1)
+    float degrees;           // what was asked for (for the report)
+    int32_t start_count[2];  // encoder counts when the turn started
+    int32_t target_counts;   // how far each wheel has to roll, in counts
+    bool done[2];            // this wheel reached its target and is braked
+    uint32_t settle_ms;      // ms since both wheels braked
+    bool then_drive;         // n/s/e/w turn: drive forward at DRIVE_SPEED_MM_S once it's done (tcw/tccw just stop)
+} turn;
+
+static void turn_start(bool clockwise, float degrees, float speed_mm_s)
+{
+    if (degrees < 0) degrees = -degrees;
+    if (degrees > 3600) degrees = 3600;
+    if (speed_mm_s <= 0) speed_mm_s = TURN_SPEED_MM_S;
+
+    // clockwise seen from above = left wheel forward, right wheel backward
+    turn.dir[ENC_LEFT] = clockwise ? 1 : -1;
+    turn.dir[ENC_RIGHT] = clockwise ? -1 : 1;
+    turn.degrees = degrees;
+    float wheel_mm = degrees / 360.0f * 3.14159265f * TRACK_WIDTH_MM;
+    turn.target_counts = (int32_t)lroundf(wheel_mm / MM_PER_COUNT) - TURN_COAST_COUNTS;
+    turn.start_count[ENC_LEFT] = encoder_count(ENC_LEFT);
+    turn.start_count[ENC_RIGHT] = encoder_count(ENC_RIGHT);
+    turn.done[ENC_LEFT] = turn.done[ENC_RIGHT] = turn.target_counts <= 0;
+    turn.braking = false;
+    turn.settle_ms = 0;
+    turn.then_drive = false;   // the n/s/e/w code sets it after calling this
+    turn.active = true;
+
+    speed_reset_integral();
+    for (int side = 0; side < 2; side++) {
+        speed_ctl.target_cps[side] = turn.done[side] ? 0 : turn.dir[side] * mm_s_to_cps(speed_mm_s);
+    }
+    speed_ctl.active = true;
+    motors_enable(true);
+}
+
+// runs every motor_task tick while turning (the speed control itself still runs every CONTROL_PERIOD_MS)
+static void turn_update(void)
+{
+    int32_t moved[2];   // how far each wheel has rolled in its own turning direction, in counts
+    for (int side = 0; side < 2; side++) {
+        moved[side] = (encoder_count(side) - turn.start_count[side]) * turn.dir[side];
+        if (!turn.done[side] && moved[side] >= turn.target_counts) {
+            // this wheel is there: brake it right now instead of waiting for the next control tick
+            turn.done[side] = true;
+            speed_ctl.target_cps[side] = 0;
+            speed_ctl.integral[side] = 0;
+            set_motor(side, 0);
+        }
+    }
+
+    if (!(turn.done[ENC_LEFT] && turn.done[ENC_RIGHT])) {
+        return;
+    }
+
+    // both braked. wait until they've actually stopped rolling so the report includes the coast
+    turn.braking = true;
+    turn.settle_ms++;
+    bool stopped = fabsf(measured_cps[ENC_LEFT]) < 20 && fabsf(measured_cps[ENC_RIGHT]) < 20;
+    if (!stopped && turn.settle_ms < TURN_SETTLE_MS) {
+        return;
+    }
+
+    turn.active = false;
+    speed_ctl.active = false;
+    motors_stop();
+
+    // real angle from what the wheels actually rolled (average of the two)
+    float avg_counts = (moved[ENC_LEFT] + moved[ENC_RIGHT]) / 2.0f;
+    float actual_deg = avg_counts * MM_PER_COUNT / (3.14159265f * TRACK_WIDTH_MM) * 360.0f;
+    int32_t coast = lroundf(avg_counts) - (turn.target_counts + TURN_COAST_COUNTS);
+    char msg[MSG_LEN];
+    snprintf(msg, sizeof(msg), "turn done: asked %.1f deg, wheels say %.1f deg (L=%ld R=%ld counts, %+ld past target)",
+             turn.degrees, actual_deg, (long)moved[ENC_LEFT], (long)moved[ENC_RIGHT], (long)coast);
+    comms_send(msg);
+
+    // the turn was the first half of an n/s/e/w command: now drive off the way we're facing
+    if (turn.then_drive) {
+        drive_straight(DRIVE_SPEED_MM_S, false);
+    }
+}
+
 // commands from console.py, same as the arduino version. one number = both wheels, two = left right
 //   d <duty%>          open loop duty, -100..100 (turns the motors back on if x turned them off)
-//   s or 0             stop with the brake
+//   0 or stop          stop with the brake (s is south now)
+//   n / s / e / w      go that way on the board at DRIVE_SPEED_MM_S, turning 90 first if needed (opposite = reverse)
 //   x                  master off, EN low so the motors coast
 //   v <mm/s>           drive at a speed using the feedforward table (one number = both wheels, two = left right)
 //   o <duty%> <ms>     duty step test for tune.py (any other command cancels it)
 //   p <mm/s> <ms>      speed step test for tune.py's vstep
+//   tcw <deg> [mm/s]   turn clockwise in place by deg degrees, then brake (default 100 mm/s wheel speed)
+//   tccw <deg> [mm/s]  same, counter clockwise
 //   kp <x>, ki <x>     set a PI gain (doesnt stop the motors)
 //   show               reply with the PI gains
 static void handle_command(const char *cmd)
@@ -396,7 +524,7 @@ static void handle_command(const char *cmd)
     char reply[MSG_LEN];
 
     // gain commands first: they only change a number, so they dont stop whatever is running.
-    // "show" has to be checked before "s" (stop) since it also starts with s
+    // "show" is checked here, before anything that looks at the first letter alone
     float gain;
     if (strncmp(cmd, "kp", 2) == 0 || strncmp(cmd, "ki", 2) == 0) {
         if (sscanf(cmd + 2, "%f", &gain) == 1 && gain >= 0) {
@@ -418,13 +546,69 @@ static void handle_command(const char *cmd)
         return;
     }
 
+    // a new command always takes over from a step test, turn or speed mode that's still running
+    bool was_speed_mode = speed_ctl.active && !turn.active;
+    step.active = false;
+    turn.active = false;
+    speed_ctl.active = false;
+
+    // tcw / tccw (checked before the one letter commands so "tcw" isnt read as something else)
+    bool cw = strncmp(cmd, "tcw", 3) == 0;
+    bool ccw = strncmp(cmd, "tccw", 4) == 0;
+    if (cw || ccw) {
+        float degrees = 0, speed_mm_s = 0;
+        if (sscanf(cmd + (cw ? 3 : 4), "%f %f", &degrees, &speed_mm_s) >= 1) {
+            turn_start(cw, degrees, speed_mm_s);
+            snprintf(reply, sizeof(reply), "turning %s %.1f deg (%ld counts per wheel)", cw ? "cw" : "ccw",
+                     turn.degrees, (long)turn.target_counts);
+        } else {
+            motors_stop();
+            snprintf(reply, sizeof(reply), "usage: tcw 90  or  tccw 90  (optional wheel speed: tcw 90 150)");
+        }
+        comms_send(reply);
+        return;
+    }
+
+    // n / s / e / w: only counts when the whole command is that one letter, so "stop" isnt read as south
+    dir_t want = NO_DIR;
+    if (cmd[1] == '\0') {
+        switch (cmd[0]) {
+            case 'n': want = NORTH; break;
+            case 'e': want = EAST;  break;
+            case 's': want = SOUTH; break;
+            case 'w': want = WEST;  break;
+            default:  break;
+        }
+    }
+    if (want != NO_DIR) {
+        // how many 90 deg cw steps from where we face to where we want to go, wrapped into 0..3
+        int diff = ((want - facing) % 4 + 4) % 4;
+        if (diff == 0) {
+            // already facing it
+            drive_straight(DRIVE_SPEED_MM_S, was_speed_mode);
+            snprintf(reply, sizeof(reply), "going %c: forward (facing %c)", "NESW"[want], "NESW"[facing]);
+        } else if (diff == 2) {
+            // it's right behind us: reverse instead of turning 180. facing does NOT change, the front still points
+            // the same way, we're just rolling backward
+            drive_straight(-DRIVE_SPEED_MM_S, was_speed_mode);
+            snprintf(reply, sizeof(reply), "going %c: backward (facing %c)", "NESW"[want], "NESW"[facing]);
+        } else {
+            // diff 1 = it's 90 cw of us, diff 3 = 90 ccw. turn, then turn_update drives forward when it's done
+            bool clockwise = diff == 1;
+            turn_start(clockwise, 90, 0);
+            turn.then_drive = true;
+            // set now rather than when the turn ends so the next command is worked out from the new way.
+            // TODO: if another command interrupts the turn half way, the bot is really pointing somewhere in between
+            facing = want;
+            snprintf(reply, sizeof(reply), "going %c: turning %s 90 then forward (facing %c)", "NESW"[want],
+                     clockwise ? "cw" : "ccw", "NESW"[facing]);
+        }
+        comms_send(reply);
+        return;
+    }
+
     int left = 0, right = 0;
     int n = sscanf(cmd + 1, "%d %d", &left, &right); // n = numbers in the command
-
-    // a new command always takes over from a step test or speed mode that's still running
-    bool was_speed_mode = speed_ctl.active;
-    step.active = false;
-    speed_ctl.active = false;
 
     if ((cmd[0] == 'o' || cmd[0] == 'p') && n >= 1) {
         bool speed = cmd[0] == 'p';
@@ -459,7 +643,7 @@ static void handle_command(const char *cmd)
         set_motor(ENC_RIGHT, right);
         motors_enable(true);
         snprintf(reply, sizeof(reply), "duty set to L=%d%% R=%d%%", left, right);
-    } else if (cmd[0] == 's' || cmd[0] == '0') {
+    } else if (cmd[0] == '0' || strcmp(cmd, "stop") == 0) {
         motors_stop();
         snprintf(reply, sizeof(reply), "stopped");
     } else if (cmd[0] == 'x') {
@@ -557,6 +741,11 @@ static void motor_task(void *arg)
 
         if (step.active) {
             step_update();
+        } else if (turn.active) {
+            turn_update();   // checks the counts every tick so it brakes within 1 ms of the target
+            if (speed_ctl.active && control_due()) {
+                speed_update();
+            }
         } else if (speed_ctl.active && control_due()) {
             speed_update();
         }
